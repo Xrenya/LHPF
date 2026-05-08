@@ -1,0 +1,7 @@
+_target_: src.models.pluto.pluto_trainer.LightningTrainer
+use_collision_loss: true
+use_contrast_loss: false
+regulate_yaw: false
+comfort_loss_weight: 0.0
+comfort_dt: 0.1
+pretrained_pluto_checkpoint:
