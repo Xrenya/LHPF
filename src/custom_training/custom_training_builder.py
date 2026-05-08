@@ -101,6 +101,12 @@ def build_lightning_datamodule(
     # Build features and targets
     feature_builders = model.get_list_of_required_feature()
     target_builders = model.get_list_of_computed_target()
+    use_lhpf_history = bool(OmegaConf.select(cfg, "model.use_lhpf", default=False))
+    if use_lhpf_history and cfg.cache.use_cache_without_dataset:
+        raise ValueError(
+            "LHPF training needs source scenarios to build previous-step features; "
+            "set cache.use_cache_without_dataset=false."
+        )
 
     # Build splitter
     splitter = build_splitter(cfg.splitter)
@@ -132,6 +138,13 @@ def build_lightning_datamodule(
         augmentors=augmentors,
         worker=worker,
         scenario_type_sampling_weights=cfg.scenario_type_weights.scenario_type_sampling_weights,
+        use_lhpf_history=use_lhpf_history,
+        lhpf_current_iteration=int(
+            OmegaConf.select(cfg, "lhpf_training.current_iteration", default=1)
+        ),
+        lhpf_previous_iteration_delta=int(
+            OmegaConf.select(cfg, "lhpf_training.previous_iteration_delta", default=1)
+        ),
         **cfg.data_loader.datamodule,
     )
 

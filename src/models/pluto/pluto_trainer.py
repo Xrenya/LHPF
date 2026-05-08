@@ -70,6 +70,7 @@ class LightningTrainer(pl.LightningModule):
         self.comfort_dt = comfort_dt
         self.pretrained_pluto_checkpoint = pretrained_pluto_checkpoint
         self._pretrained_pluto_loaded = False
+        self.metrics = None
 
         self.radius = model.radius
         self.num_modes = model.num_modes
@@ -86,7 +87,18 @@ class LightningTrainer(pl.LightningModule):
             self.collision_loss = ESDFCollisionLoss()
 
     def on_fit_start(self) -> None:
+        self._setup_runtime_state()
+
+    def on_validation_start(self) -> None:
+        self._setup_runtime_state()
+
+    def on_test_start(self) -> None:
+        self._setup_runtime_state()
+
+    def _setup_runtime_state(self) -> None:
         self._load_pretrained_pluto()
+        if self.metrics is not None:
+            return
         metrics_collection = MetricCollection(
             [
                 minADE().to(self.device),
@@ -99,6 +111,7 @@ class LightningTrainer(pl.LightningModule):
         self.metrics = {
             "train": metrics_collection.clone(prefix="train/"),
             "val": metrics_collection.clone(prefix="val/"),
+            "test": metrics_collection.clone(prefix="test/"),
         }
 
     def _load_pretrained_pluto(self) -> None:
@@ -142,13 +155,94 @@ class LightningTrainer(pl.LightningModule):
         :return: model's scalar loss
         """
         features, targets, scenarios = batch
-        res = self.forward(features["feature"].data)
+        data = features["feature"].data
+        self._attach_lhpf_training_history(data)
+        res = self.forward(data)
 
-        losses = self._compute_objectives(res, features["feature"].data)
-        metrics = self._compute_metrics(res, features["feature"].data, prefix)
+        losses = self._compute_objectives(res, data)
+        metrics = self._compute_metrics(res, data, prefix)
         self._log_step(losses["loss"], losses, metrics, prefix)
 
         return losses["loss"] if self.training else 0.0
+
+    def _attach_lhpf_training_history(self, data) -> None:
+        if not getattr(self.model, "use_lhpf", False):
+            return
+        if "reference_line" not in data:
+            raise ValueError(
+                "LHPF training requires reference_line features; set "
+                "model.feature_builder.build_reference_line=true."
+            )
+        if "historical_feature" not in data:
+            raise ValueError(
+                "LHPF training batches must include historical_feature from the "
+                "datamodule previous-step pipeline."
+            )
+
+        historical_data = data["historical_feature"]
+        model_was_training = self.model.training
+        self.model.eval()
+        try:
+            with torch.no_grad():
+                historical_out = self.model(historical_data)
+        finally:
+            self.model.train(model_was_training)
+
+        historical_embedding = historical_out.get("planning_embedding")
+        if historical_embedding is None:
+            return
+
+        historical_embedding = historical_embedding.detach()
+        historical_valid_mask = self._historical_reference_line_mask(
+            historical_data,
+            historical_embedding,
+        )
+        current_batch_size = data["agent"]["position"].shape[0]
+        historical_embedding, historical_valid_mask = self._repeat_history_to_batch(
+            historical_embedding,
+            historical_valid_mask,
+            current_batch_size,
+        )
+
+        data["reference_line"]["historical_planning_embedding"] = historical_embedding
+        data["reference_line"]["historical_planning_valid_mask"] = historical_valid_mask
+
+    def _historical_reference_line_mask(self, historical_data, historical_embedding):
+        reference_line = historical_data.get("reference_line")
+        if reference_line is None or "valid_mask" not in reference_line:
+            bs, num_ref = historical_embedding.shape[:2]
+            return torch.ones(
+                bs,
+                num_ref,
+                device=historical_embedding.device,
+                dtype=torch.bool,
+            )
+        return reference_line["valid_mask"].any(-1).to(
+            device=historical_embedding.device,
+            dtype=torch.bool,
+        )
+
+    @staticmethod
+    def _repeat_history_to_batch(
+        historical_embedding,
+        historical_valid_mask,
+        current_batch_size,
+    ):
+        history_batch_size = historical_embedding.shape[0]
+        if history_batch_size == current_batch_size:
+            return historical_embedding, historical_valid_mask
+
+        if current_batch_size % history_batch_size != 0:
+            raise ValueError(
+                "Cannot align historical planning embedding batch size "
+                f"{history_batch_size} to current batch size {current_batch_size}."
+            )
+
+        repeat_count = current_batch_size // history_batch_size
+        repeat_dims = (repeat_count,) + (1,) * (historical_embedding.dim() - 1)
+        historical_embedding = historical_embedding.repeat(repeat_dims)
+        historical_valid_mask = historical_valid_mask.repeat(repeat_count, 1)
+        return historical_embedding, historical_valid_mask
 
     def _compute_objectives(self, res, data) -> Dict[str, torch.Tensor]:
         bs, _, T, _ = res["prediction"].shape
@@ -430,6 +524,9 @@ class LightningTrainer(pl.LightningModule):
         :param targets: ground truth targets
         :return: dictionary of metrics names and values
         """
+        if self.metrics is None:
+            self._setup_runtime_state()
+
         # get top 6 modes
         trajectory, probability = res["trajectory"], res["probability"]
         r_padding_mask = ~data["reference_line"]["valid_mask"].any(-1)

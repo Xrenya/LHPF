@@ -91,6 +91,14 @@ class PlutoFeature(AbstractModelFeature):
                     [f.data[key] for f in feature_list], dim=0
                 )
 
+        if "historical_feature" in feature_list[0].data:
+            historical_features = [
+                PlutoFeature(data=f.data["historical_feature"]) for f in feature_list
+            ]
+            batch_data["historical_feature"] = PlutoFeature.collate(
+                historical_features
+            ).data
+
         return PlutoFeature(data=batch_data)
 
     def to_feature_tensor(self) -> PlutoFeature:

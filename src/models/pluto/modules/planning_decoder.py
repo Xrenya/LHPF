@@ -55,8 +55,9 @@ class DecoderLayer(nn.Module):
 
         tgt = tgt.transpose(1, 2).reshape(bs * M, R, D)
         tgt2 = self.norm1(tgt)
+        r2r_key_padding_mask = tgt_key_padding_mask.repeat_interleave(M, dim=0)
         tgt2 = self.r2r_attn(
-            tgt2, tgt2, tgt2, key_padding_mask=tgt_key_padding_mask.repeat(M, 1)
+            tgt2, tgt2, tgt2, key_padding_mask=r2r_key_padding_mask
         )[0]
         tgt = tgt + self.dropout1(tgt2)
 

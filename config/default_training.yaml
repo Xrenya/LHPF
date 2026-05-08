@@ -53,6 +53,11 @@ lr: 1e-3
 weight_decay: 0.0001
 checkpoint:
 
+# LHPF training uses a no-loss previous-step pass to build latent planning memory.
+lhpf_training:
+  current_iteration: 1
+  previous_iteration_delta: 1
+
 # wandb settings
 wandb:
   mode: disable

@@ -97,6 +97,23 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python run_training.py \
 
 - you can remove wandb related configurations if your prefer tensorboard.
 
+LHPF fine-tuning uses a previous-step no-loss pass to build latent planning memory
+for the supervised current step. Start from a PLUTO checkpoint and enable the LHPF
+decoder:
+
+```
+CUDA_VISIBLE_DEVICES=0 python run_training.py \
+  py_func=train +training=train_pluto \
+  model.use_lhpf=true model.freeze_pluto_backbone=true \
+  custom_trainer.pretrained_pluto_checkpoint=/path/to/pluto.ckpt \
+  worker=single_machine_thread_pool worker.max_workers=4 \
+  scenario_builder=nuplan cache.cache_path=/nuplan/exp/lhpf_sanity_check \
+  data_loader.params.batch_size=4 data_loader.params.num_workers=1
+```
+
+Keep `cache.use_cache_without_dataset=false` for LHPF runs because the dataset
+must read source scenarios to build the previous-step feature.
+
 
 ## Checkpoint
 

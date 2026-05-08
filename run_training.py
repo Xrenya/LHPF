@@ -74,8 +74,8 @@ def main(cfg: DictConfig) -> Optional[TrainingEngine]:
         ):
             engine = build_training_engine(cfg, worker)
 
-        # Run training
-        logger.info("Starting training...")
+        # Run validation
+        logger.info("Starting validation...")
         with ProfilerContextManager(cfg.output_dir, cfg.enable_profiling, "validate"):
             engine.trainer.validate(
                 model=engine.model,

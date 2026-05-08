@@ -19,6 +19,7 @@ from nuplan.planning.training.data_loader.scenario_dataset import ScenarioDatase
 from nuplan.planning.training.data_loader.splitter import AbstractSplitter
 from nuplan.planning.training.modeling.types import (
     FeaturesType,
+    TargetsType,
     move_features_type_to_device,
 )
 from nuplan.planning.training.preprocessing.feature_collate import FeatureCollate
@@ -32,12 +33,244 @@ logger = logging.getLogger(__name__)
 DataModuleNotSetupError = RuntimeError('Data module has not been setup, call "setup()"')
 
 
+class IterationOffsetScenario:
+    """Scenario view whose iteration 0 is offset into the source scenario."""
+
+    def __init__(self, scenario: AbstractScenario, iteration_offset: int) -> None:
+        self._scenario = scenario
+        self._iteration_offset = max(0, iteration_offset)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._scenario, name)
+
+    @property
+    def token(self) -> str:
+        return f"{self._scenario.token}_iter_{self._iteration_offset:04d}"
+
+    @property
+    def scenario_name(self) -> str:
+        return f"{self._scenario.scenario_name}_iter_{self._iteration_offset:04d}"
+
+    @property
+    def scenario_type(self) -> str:
+        return self._scenario.scenario_type
+
+    @property
+    def log_name(self) -> str:
+        return self._scenario.log_name
+
+    @property
+    def map_api(self) -> Any:
+        return self._scenario.map_api
+
+    @property
+    def database_interval(self) -> float:
+        return self._scenario.database_interval
+
+    @property
+    def initial_ego_state(self) -> Any:
+        return self.get_ego_state_at_iteration(0)
+
+    @property
+    def initial_tracked_objects(self) -> Any:
+        return self.get_tracked_objects_at_iteration(0)
+
+    @property
+    def start_time(self) -> Any:
+        return self.get_time_point(0)
+
+    @property
+    def end_time(self) -> Any:
+        return self._scenario.end_time
+
+    @property
+    def ego_vehicle_parameters(self) -> Any:
+        return self._scenario.ego_vehicle_parameters
+
+    def _num_iterations(self) -> Optional[int]:
+        if not hasattr(self._scenario, "get_number_of_iterations"):
+            return None
+        return self._scenario.get_number_of_iterations()
+
+    def _shift_iteration(self, iteration: int) -> int:
+        shifted_iteration = self._iteration_offset + iteration
+        num_iterations = self._num_iterations()
+        if num_iterations is None:
+            return max(0, shifted_iteration)
+        return max(0, min(shifted_iteration, num_iterations - 1))
+
+    def get_number_of_iterations(self) -> int:
+        num_iterations = self._num_iterations()
+        if num_iterations is None:
+            return 1
+        return max(1, num_iterations - self._iteration_offset)
+
+    def get_time_point(self, iteration: int) -> Any:
+        return self._scenario.get_time_point(self._shift_iteration(iteration))
+
+    def get_ego_state_at_iteration(self, iteration: int) -> Any:
+        return self._scenario.get_ego_state_at_iteration(
+            self._shift_iteration(iteration)
+        )
+
+    def get_tracked_objects_at_iteration(self, iteration: int) -> Any:
+        return self._scenario.get_tracked_objects_at_iteration(
+            self._shift_iteration(iteration)
+        )
+
+    def get_sensors_at_iteration(self, iteration: int) -> Any:
+        return self._scenario.get_sensors_at_iteration(self._shift_iteration(iteration))
+
+    def get_lidar_to_ego_transform(self) -> Any:
+        return self._scenario.get_lidar_to_ego_transform()
+
+    def get_mission_goal(self) -> Any:
+        return self._scenario.get_mission_goal()
+
+    def get_route_roadblock_ids(self) -> List[str]:
+        return self._scenario.get_route_roadblock_ids()
+
+    def get_traffic_light_status_at_iteration(self, iteration: int) -> Any:
+        return self._scenario.get_traffic_light_status_at_iteration(
+            self._shift_iteration(iteration)
+        )
+
+    def get_past_timestamps(self, iteration: int, *args: Any, **kwargs: Any) -> Any:
+        return self._scenario.get_past_timestamps(
+            self._shift_iteration(iteration), *args, **kwargs
+        )
+
+    def get_future_timestamps(self, iteration: int, *args: Any, **kwargs: Any) -> Any:
+        return self._scenario.get_future_timestamps(
+            self._shift_iteration(iteration), *args, **kwargs
+        )
+
+    def get_ego_past_trajectory(
+        self, iteration: int, *args: Any, **kwargs: Any
+    ) -> Any:
+        return self._scenario.get_ego_past_trajectory(
+            self._shift_iteration(iteration), *args, **kwargs
+        )
+
+    def get_ego_future_trajectory(
+        self, iteration: int, *args: Any, **kwargs: Any
+    ) -> Any:
+        return self._scenario.get_ego_future_trajectory(
+            self._shift_iteration(iteration), *args, **kwargs
+        )
+
+    def get_past_tracked_objects(
+        self, iteration: int, *args: Any, **kwargs: Any
+    ) -> Any:
+        return self._scenario.get_past_tracked_objects(
+            self._shift_iteration(iteration), *args, **kwargs
+        )
+
+    def get_future_tracked_objects(
+        self, iteration: int, *args: Any, **kwargs: Any
+    ) -> Any:
+        return self._scenario.get_future_tracked_objects(
+            self._shift_iteration(iteration), *args, **kwargs
+        )
+
+
+class LHPFScenarioDataset(torch.utils.data.Dataset):
+    """
+    Dataset that returns the current scenario feature plus a previous-step feature.
+
+    The trainer uses the previous feature to run the frozen/no-loss history pass
+    and attach a detached planning embedding before computing the current loss.
+    """
+
+    def __init__(
+        self,
+        scenarios: List[AbstractScenario],
+        feature_preprocessor: FeaturePreprocessor,
+        augmentors: Optional[List[AbstractAugmentor]] = None,
+        current_iteration: int = 1,
+        previous_iteration_delta: int = 1,
+    ) -> None:
+        self._scenarios = scenarios
+        self._feature_preprocessor = feature_preprocessor
+        self._augmentors = augmentors
+        self._current_iteration = max(0, current_iteration)
+        self._previous_iteration_delta = max(1, previous_iteration_delta)
+
+    def __len__(self) -> int:
+        return len(self._scenarios)
+
+    def __getitem__(
+        self, idx: int
+    ) -> Tuple[FeaturesType, TargetsType, AbstractScenario]:
+        scenario = self._scenarios[idx]
+        current_iteration = self._resolve_current_iteration(scenario)
+        previous_iteration = max(0, current_iteration - self._previous_iteration_delta)
+
+        current_scenario = IterationOffsetScenario(scenario, current_iteration)
+        previous_scenario = IterationOffsetScenario(scenario, previous_iteration)
+
+        features, targets = self._compute_features(current_scenario)
+        if self._augmentors is not None:
+            for augmentor in self._augmentors:
+                features, targets = augmentor.augment(
+                    features, targets, current_scenario
+                )
+
+        previous_features, _ = self._compute_features(previous_scenario)
+        feature_name = next(iter(features))
+        previous_feature = previous_features[feature_name]
+        features[feature_name].data["historical_feature"] = (
+            self._strip_historical_feature(previous_feature.data)
+        )
+
+        features = {
+            feature_name: feature.to_feature_tensor()
+            for feature_name, feature in features.items()
+        }
+        targets = {
+            target_name: target.to_feature_tensor()
+            for target_name, target in targets.items()
+        }
+
+        return features, targets, current_scenario
+
+    def _resolve_current_iteration(self, scenario: AbstractScenario) -> int:
+        if not hasattr(scenario, "get_number_of_iterations"):
+            return self._current_iteration
+        return min(
+            self._current_iteration,
+            max(0, scenario.get_number_of_iterations() - 1),
+        )
+
+    def _compute_features(
+        self, scenario: AbstractScenario
+    ) -> Tuple[FeaturesType, TargetsType]:
+        computed_features = self._feature_preprocessor.compute_features(scenario)
+        return computed_features[0], computed_features[1]
+
+    @staticmethod
+    def _strip_historical_feature(data: Dict[str, Any]) -> Dict[str, Any]:
+        model_input_keys = {
+            "agent",
+            "map",
+            "reference_line",
+            "static_objects",
+            "current_state",
+            "origin",
+            "angle",
+        }
+        return {key: value for key, value in data.items() if key in model_input_keys}
+
+
 def create_dataset(
     samples: List[AbstractScenario],
     feature_preprocessor: FeaturePreprocessor,
     dataset_fraction: float,
     dataset_name: str,
     augmentors: Optional[List[AbstractAugmentor]] = None,
+    use_lhpf_history: bool = False,
+    lhpf_current_iteration: int = 1,
+    lhpf_previous_iteration_delta: int = 1,
 ) -> torch.utils.data.Dataset:
     """
     Create a dataset from a list of samples.
@@ -50,10 +283,20 @@ def create_dataset(
     :return: The instantiated torch dataset.
     """
     # Sample the desired fraction from the total samples
-    num_keep = int(len(samples) * dataset_fraction)
+    num_keep = max(1, int(len(samples) * dataset_fraction))
+    num_keep = min(len(samples), num_keep)
     selected_scenarios = random.sample(samples, num_keep)
 
     logger.info(f"Number of samples in {dataset_name} set: {len(selected_scenarios)}")
+    if use_lhpf_history:
+        return LHPFScenarioDataset(
+            scenarios=selected_scenarios,
+            feature_preprocessor=feature_preprocessor,
+            augmentors=augmentors,
+            current_iteration=lhpf_current_iteration,
+            previous_iteration_delta=lhpf_previous_iteration_delta,
+        )
+
     return ScenarioDataset(
         scenarios=selected_scenarios,
         feature_preprocessor=feature_preprocessor,
@@ -117,6 +360,9 @@ class CustomDataModule(pl.LightningDataModule):
         scenario_type_sampling_weights: DictConfig,
         worker: WorkerPool,
         augmentors: Optional[List[AbstractAugmentor]] = None,
+        use_lhpf_history: bool = False,
+        lhpf_current_iteration: int = 1,
+        lhpf_previous_iteration_delta: int = 1,
     ) -> None:
         """
         Initialize the class.
@@ -166,6 +412,11 @@ class CustomDataModule(pl.LightningDataModule):
         # Worker for multiprocessing to speed up initialization of datasets
         self._worker = worker
 
+        # LHPF training samples need a previous-step feature to build latent memory.
+        self._use_lhpf_history = use_lhpf_history
+        self._lhpf_current_iteration = lhpf_current_iteration
+        self._lhpf_previous_iteration_delta = lhpf_previous_iteration_delta
+
     @property
     def feature_and_targets_builder(self) -> FeaturePreprocessor:
         """Get feature and target builders."""
@@ -193,6 +444,9 @@ class CustomDataModule(pl.LightningDataModule):
                 self._train_fraction,
                 "train",
                 self._augmentors,
+                self._use_lhpf_history,
+                self._lhpf_current_iteration,
+                self._lhpf_previous_iteration_delta,
             )
 
             # Validation Dataset
@@ -206,6 +460,9 @@ class CustomDataModule(pl.LightningDataModule):
                 self._feature_preprocessor,
                 self._val_fraction,
                 "validation",
+                use_lhpf_history=self._use_lhpf_history,
+                lhpf_current_iteration=self._lhpf_current_iteration,
+                lhpf_previous_iteration_delta=self._lhpf_previous_iteration_delta,
             )
         elif stage == "validate":
             # Validation Dataset
@@ -219,6 +476,9 @@ class CustomDataModule(pl.LightningDataModule):
                 self._feature_preprocessor,
                 self._val_fraction,
                 "validation",
+                use_lhpf_history=self._use_lhpf_history,
+                lhpf_current_iteration=self._lhpf_current_iteration,
+                lhpf_previous_iteration_delta=self._lhpf_previous_iteration_delta,
             )
         elif stage == "test":
             # Testing Dataset
@@ -228,10 +488,18 @@ class CustomDataModule(pl.LightningDataModule):
             assert len(test_samples) > 0, "Splitter returned no test samples"
 
             self._test_set = create_dataset(
-                test_samples, self._feature_preprocessor, self._test_fraction, "test"
+                test_samples,
+                self._feature_preprocessor,
+                self._test_fraction,
+                "test",
+                use_lhpf_history=self._use_lhpf_history,
+                lhpf_current_iteration=self._lhpf_current_iteration,
+                lhpf_previous_iteration_delta=self._lhpf_previous_iteration_delta,
             )
         else:
-            raise ValueError(f'Stage must be one of ["fit", "test"], got ${stage}.')
+            raise ValueError(
+                f'Stage must be one of ["fit", "validate", "test"], got ${stage}.'
+            )
 
     def teardown(self, stage: Optional[str] = None) -> None:
         """
