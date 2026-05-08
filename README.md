@@ -40,7 +40,7 @@ sh ./script/setup_env.sh
 ```
 
 ## Feature Cache
-In progress.. (was not test yet)
+In progress.. (was not test yet)  
 Preprocess the dataset to accelerate training. It is recommended to run a small sanity check to make sure everything is correctly setup.
 
 ```
